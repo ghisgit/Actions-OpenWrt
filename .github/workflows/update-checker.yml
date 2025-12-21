@@ -1,13 +1,6 @@
 #
-# https://github.com/P3TERX/Actions-OpenWrt
-#
-# File: .github/workflows/update-checker.yml
-# Description: Source code update checker
-#
-# Copyright (c) 2019-2024 P3TERX <https://p3terx.com>
-#
-# This is free software, licensed under the MIT License.
-# See /LICENSE for more information.
+# Source code update checker (Manual Trigger Only)
+# Fixed cache logic to compare current vs last commit
 #
 
 name: Update Checker
@@ -18,42 +11,68 @@ env:
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 22 1 * *'
 
 jobs:
   check:
     runs-on: ubuntu-latest
-
     steps:
+      - name: Checkout (for cache support)
+        uses: actions/checkout@v4
 
-    - name: Get Commit Hash
-      id: getHash
-      run: |
-        git clone --depth 1 $REPO_URL -b $REPO_BRANCH .
-        echo "commitHash=$(git rev-parse HEAD)" >> $GITHUB_OUTPUT
+      - name: Restore last recorded commit hash
+        id: restore_cache
+        uses: actions/cache@v4
+        with:
+          path: .last_commit
+          key: update-checker-last-commit-${{ env.REPO_URL }}-${{ env.REPO_BRANCH }}
 
-    - name: Compare Commit Hash
-      id: cacheHash
-      uses: actions/cache@v3
-      with:
-        path: .commitHash
-        key: commitHash_${{ steps.getHash.outputs.commitHash }}
+      - name: Fetch current HEAD commit
+        id: fetch_current
+        run: |
+          set -euo pipefail
+          git clone --depth=1 "${REPO_URL}" -b "${REPO_BRANCH}" temp_repo
+          cd temp_repo
+          CURRENT=$(git rev-parse HEAD)
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          echo "$CURRENT" > ../.current_commit
 
-    - name: Save New Commit Hash
-      if: steps.cacheHash.outputs.cache-hit != 'true'
-      run: |
-        echo ${{ steps.getHash.outputs.commitHash }} | tee .commitHash
+      - name: Compare with last recorded commit
+        id: compare
+        run: |
+          if [ -f .last_commit ]; then
+            LAST=$(cat .last_commit)
+            echo "last=$LAST" >> $GITHUB_OUTPUT
+            if [ "$LAST" = "$(cat .current_commit)" ]; then
+              echo "changed=false" >> $GITHUB_OUTPUT
+              echo "No new commits. Build not triggered."
+            else
+              echo "changed=true" >> $GITHUB_OUTPUT
+              echo "New commit detected: $LAST → $(cat .current_commit)"
+            fi
+          else
+            echo "last=" >> $GITHUB_OUTPUT
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "First run or no previous record. Triggering build."
+          fi
 
-    - name: Trigger build
-      if: steps.cacheHash.outputs.cache-hit != 'true'
-      uses: peter-evans/repository-dispatch@v2
-      with:
-        token: ${{ github.token }}
-        event-type: Source Code Update
+      - name: Save current commit as last
+        if: steps.compare.outputs.changed == 'true'
+        run: cp .current_commit .last_commit
 
-    - name: Delete workflow runs
-      uses: Mattraks/delete-workflow-runs@v2
-      with:
-        retain_days: 0
-        keep_minimum_runs: 2
+      - name: Cache the last commit hash
+        if: always()
+        uses: actions/cache@v4
+        with:
+          path: .last_commit
+          key: update-checker-last-commit-${{ env.REPO_URL }}-${{ env.REPO_BRANCH }}
+
+      - name: Trigger OpenWrt Builder
+        if: steps.compare.outputs.changed == 'true'
+        uses: peter-evans/repository-dispatch@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          event-type: Source Code Update
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf temp_repo .current_commit
